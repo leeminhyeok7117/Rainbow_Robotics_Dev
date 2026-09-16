@@ -1,0 +1,38 @@
+import argparse, time
+import numpy as np, mujoco, mujoco.viewer
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from rby1_reach_env import Rby1ReachEnv
+
+p = argparse.ArgumentParser()
+p.add_argument("--out", default="runs/reach")
+p.add_argument("--speed", type=float, default=1.0)      # 0.5=슬로우모션, 2.0=2배속
+p.add_argument("--stochastic", action="store_true")     # 탐색 노이즈 켜고 보기
+a = p.parse_args()
+
+env = Rby1ReachEnv()
+# VecNormalize 를 직접 못 쓰므로 관측 정규화 통계만 빌려온다
+vn = VecNormalize.load(f"{a.out}/vecnorm.pkl", DummyVecEnv([lambda: Rby1ReachEnv()]))
+vn.training = False
+model = PPO.load(f"{a.out}/ppo_reach", device="cpu")
+
+dt = env.frame_skip * env.model.opt.timestep / a.speed   # 0.02s @ 50Hz
+obs, _ = env.reset()
+ep, t = 0, 0
+
+with mujoco.viewer.launch_passive(env.model, env.data) as v:
+    next_t = time.time()
+    while v.is_running():
+        act, _ = model.predict(vn.normalize_obs(obs), deterministic=not a.stochastic)
+        obs, r, term, trunc, info = env.step(act)
+        v.sync()
+        t += 1
+        if trunc:                                        # 에피소드 끝 -> 새 목표
+            print(f"ep {ep:3d}  final dist {info['dist']*1000:5.1f}mm  "
+                  f"{'SUCCESS' if info['is_success'] else 'fail'}")
+            ep, t = ep + 1, 0
+            obs, _ = env.reset()
+            time.sleep(0.4)                              # 목표 바뀌는 순간 눈으로 보이게
+            next_t = time.time()
+        next_t += dt
+        time.sleep(max(0.0, next_t - time.time()))

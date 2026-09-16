@@ -1,0 +1,114 @@
+import os
+import numpy as np
+import mujoco
+import gymnasium as gym
+from gymnasium import spaces
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+XML        = os.path.join(HERE, "models", "rby1_reach.xml")
+XML_TORQUE = os.path.join(HERE, "models", "rby1_reach_torque.xml")
+
+ARM_JOINTS   = [f"right_arm_{i}" for i in range(7)]
+ARM_ACTS     = [f"right_arm_{i+1}_act" for i in range(7)]   # 액추에이터는 1-indexed
+TORSO_JOINTS = [f"torso_{i}" for i in range(6)]
+TORSO_ACTS   = [f"link{i+1}_act" for i in range(6)]
+
+READY_TORSO = np.deg2rad([0., 0., 0., 20., 0., 0.])          # SDK ready pose
+READY_ARM   = np.deg2rad([15., -65., -15., -115., 75., -65., -5.])
+
+# 오른팔 도달 가능 영역 (월드 좌표, 어깨는 [0.133, -0.22, 1.347])
+TARGET_LOW  = np.array([0.25, -0.55, 0.85])
+TARGET_HIGH = np.array([0.60, -0.05, 1.35])
+
+
+class Rby1ReachEnv(gym.Env):
+    metadata = {"render_modes": ["rgb_array"], "render_fps": 50}
+
+    def __init__(self, render_mode=None, frame_skip=10, max_steps=150,
+                 max_delta=0.05, success_radius=0.05, disable_contact=True,
+                 control_mode="position"):
+        assert control_mode in ("position", "torque")
+        self.control_mode = control_mode
+        self.model = mujoco.MjModel.from_xml_path(XML_TORQUE if control_mode == "torque" else XML)
+        if disable_contact:                                   # 함정 ② : 18배 빨라짐
+            self.model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
+        self.data = mujoco.MjData(self.model)
+
+        nid = lambda t, n: mujoco.mj_name2id(self.model, t, n)
+        J, A, S = mujoco.mjtObj.mjOBJ_JOINT, mujoco.mjtObj.mjOBJ_ACTUATOR, mujoco.mjtObj.mjOBJ_SITE
+        self.arm_qadr   = np.array([self.model.jnt_qposadr[nid(J, n)] for n in ARM_JOINTS])
+        self.arm_vadr   = np.array([self.model.jnt_dofadr[nid(J, n)]  for n in ARM_JOINTS])
+        self.arm_act    = np.array([nid(A, n) for n in ARM_ACTS])
+        self.torso_qadr = np.array([self.model.jnt_qposadr[nid(J, n)] for n in TORSO_JOINTS])
+        self.torso_act  = np.array([nid(A, n) for n in TORSO_ACTS])
+        self.tcp_sid    = nid(S, "tcp_r")
+        self.target_sid = nid(S, "target")
+        self.target_mid = self.model.body_mocapid[nid(mujoco.mjtObj.mjOBJ_BODY, "target_body")]  # mocap 배열 안 인덱스
+
+        self.ctrl_lo = self.model.actuator_ctrlrange[self.arm_act, 0]
+        self.ctrl_hi = self.model.actuator_ctrlrange[self.arm_act, 1]
+
+        self.frame_skip, self.max_steps = frame_skip, max_steps    # 0.002*10 = 50Hz 제어
+        self.max_delta, self.success_radius = max_delta, success_radius
+        self.render_mode, self._renderer = render_mode, None
+
+        self.action_space      = spaces.Box(-1., 1., (7,), np.float32)
+        self.observation_space = spaces.Box(-np.inf, np.inf, (23,), np.float32)
+
+    def _tcp(self):
+        return self.data.site_xpos[self.tcp_sid].copy()
+
+    def _obs(self):
+        q   = self.data.qpos[self.arm_qadr]              # 7  관절각
+        qd  = self.data.qvel[self.arm_vadr] * 0.1        # 7  관절속도 (스케일 맞춤)
+        tcp = self._tcp()                                # 3  손끝 위치
+        return np.concatenate([q, qd, tcp, self.target,  # 3  목표 위치
+                               tcp - self.target]).astype(np.float32)   # 3 상대벡터
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        mujoco.mj_resetData(self.model, self.data)
+        self.data.qpos[self.torso_qadr] = READY_TORSO
+        self.data.qpos[self.arm_qadr]   = READY_ARM + self.np_random.uniform(-0.1, 0.1, 7)
+        self.data.ctrl[:] = 0.
+        self.data.ctrl[self.torso_act] = READY_TORSO     # 토르소는 고정 유지
+        # position: 현재 관절각을 목표로 두고 시작 / torque: 토크 0 에서 시작
+        self.data.ctrl[self.arm_act] = (
+            0.0 if self.control_mode == "torque" else self.data.qpos[self.arm_qadr])
+        self.target = self.np_random.uniform(TARGET_LOW, TARGET_HIGH)
+        self.data.mocap_pos[self.target_mid] = self.target
+        mujoco.mj_forward(self.model, self.data)
+        self.t, self.prev_a = 0, np.zeros(7)
+        return self._obs(), {}
+
+    def step(self, action):
+        a = np.clip(action, -1., 1.)
+        if self.control_mode == "torque":
+            # [-1,1] -> 관절별 토크 한계로 스케일. PD 제어기가 없으므로
+            # 중력 보상 / 감속 / 정지 유지를 전부 정책이 직접 해내야 한다.
+            self.data.ctrl[self.arm_act] = a * self.ctrl_hi
+        else:
+            # 절대각을 직접 내보내는 대신 "현재 목표각 + 증분" -> 학습이 훨씬 안정적
+            self.data.ctrl[self.arm_act] = np.clip(
+                self.data.ctrl[self.arm_act] + a * self.max_delta, self.ctrl_lo, self.ctrl_hi)
+        mujoco.mj_step(self.model, self.data, nstep=self.frame_skip)
+
+        d = float(np.linalg.norm(self._tcp() - self.target))
+        success = d < self.success_radius
+        r = (-d                                                        # 거리 (dense)
+             + (1.0 if success else 0.0)                               # 도달 보너스
+             - 0.010  * float(np.sum(a ** 2))                          # 과한 액션 억제
+             - 0.005  * float(np.sum((a - self.prev_a) ** 2))          # 액션 변화율 (sim2real 핵심)
+             - 0.0005 * float(np.sum(self.data.qvel[self.arm_vadr] ** 2)))  # 진동 억제
+        self.prev_a, self.t = a, self.t + 1
+        return self._obs(), r, False, self.t >= self.max_steps, {"dist": d, "is_success": success}
+
+    def render(self):
+        if self._renderer is None:
+            self._renderer = mujoco.Renderer(self.model, 480, 640)
+        self._renderer.update_scene(self.data, camera=-1)
+        return self._renderer.render()
+
+    def close(self):
+        if self._renderer is not None:
+            self._renderer.close(); self._renderer = None
